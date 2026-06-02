@@ -82,10 +82,13 @@ struct MatchSolution: Identifiable {
 // MARK: - ViewModel
 
 final class VM: ObservableObject {
-    @Published var loadR = 20.0,  loadX  = 50.0
-    @Published var shuntB = 1.15, seriesX = -1.1
+    @Published var loadR = 20.0
+    @Published var loadX = 50.0
+    @Published var shuntB = 1.15
+    @Published var seriesX = -1.1
     @Published var tLineDeg = 55.0
-    @Published var showY = true, showTLine = true
+    @Published var showY = true
+    @Published var showTLine = true
     let z0 = 50.0
 
     // Feature 1: Interactive tap/drag
