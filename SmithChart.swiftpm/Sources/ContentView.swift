@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // MARK: - Complex Number
 
@@ -40,6 +43,10 @@ struct SCE {
     static func screen(_ g: Complex, _ c: CGPoint, _ r: CGFloat) -> CGPoint {
         CGPoint(x: c.x + CGFloat(g.re)*r, y: c.y - CGFloat(g.im)*r)
     }
+    /// Convert a screen point back to Γ
+    static func gammaFromScreen(_ pt: CGPoint, _ c: CGPoint, _ r: CGFloat) -> Complex {
+        Complex(Double((pt.x - c.x) / r), Double((c.y - pt.y) / r))
+    }
 }
 
 // MARK: - Marker
@@ -52,6 +59,26 @@ struct Marker: Identifiable {
     var swr: Double { let m = g.magnitude; return m < 1 ? (1+m)/(1-m) : .infinity }
 }
 
+// MARK: - Component Type for Frequency Sweep
+
+enum ComponentType: String, CaseIterable, Identifiable {
+    case seriesL   = "Series L"
+    case seriesC   = "Series C"
+    case parallelL = "Parallel L"
+    case parallelC = "Parallel C"
+    var id: String { rawValue }
+}
+
+// MARK: - Matching Solution
+
+struct MatchSolution: Identifiable {
+    var id = UUID()
+    var label: String
+    var steps: [String]
+    var shuntB: Double
+    var seriesX: Double
+}
+
 // MARK: - ViewModel
 
 final class VM: ObservableObject {
@@ -60,6 +87,21 @@ final class VM: ObservableObject {
     @Published var tLineDeg = 55.0
     @Published var showY = true, showTLine = true
     let z0 = 50.0
+
+    // Feature 1: Interactive tap/drag
+    @Published var dragGamma: Complex? = nil
+
+    // Feature 2: Frequency sweep
+    @Published var sweepEnabled = false
+    @Published var componentType: ComponentType = .seriesL
+    @Published var componentValue: Double = 10.0   // nH or pF
+    @Published var freqStart: Double = 100.0        // MHz
+    @Published var freqEnd: Double   = 3000.0       // MHz
+    @Published var freqPoints: Int   = 60
+
+    // Feature 4: Matching wizard
+    @Published var wizardEnabled = false
+    @Published var wizardSolutions: [MatchSolution] = []
 
     var markers: [Marker] {
         var ms = [Marker]()
@@ -107,10 +149,134 @@ final class VM: ObservableObject {
         }
         return segs
     }
+
+    // MARK: Feature 2 — Frequency Sweep points
+    func sweepPoints(c: CGPoint, r: CGFloat) -> [CGPoint] {
+        guard sweepEnabled, freqEnd > freqStart, freqPoints > 1 else { return [] }
+        let n = freqPoints
+        let fStart = freqStart * 1e6  // Hz
+        let fEnd   = freqEnd   * 1e6  // Hz
+        let valSI: Double
+        switch componentType {
+        case .seriesL, .parallelL:
+            valSI = componentValue * 1e-9   // nH → H
+        case .seriesC, .parallelC:
+            valSI = componentValue * 1e-12  // pF → F
+        }
+        let zLoad = Complex(loadR, loadX)
+
+        return (0..<n).compactMap { i in
+            let t = Double(i) / Double(n - 1)
+            let freq = fStart + t * (fEnd - fStart)
+            let omega = 2 * Double.pi * freq
+
+            let zTotal: Complex
+            switch componentType {
+            case .seriesL:
+                // Series inductor: Z_total = Z_load + jωL (normalized)
+                let jXl = Complex(0, omega * valSI)
+                zTotal = zLoad + jXl
+            case .seriesC:
+                // Series capacitor: Z_total = Z_load + 1/(jωC) = Z_load - j/(ωC)
+                let jXc = Complex(0, -1.0 / (omega * valSI))
+                zTotal = zLoad + jXc
+            case .parallelL:
+                // Parallel inductor: Y_total = Y_load + 1/(jωL)
+                let yLoad = SCE.Y(zLoad)
+                let yL = Complex(0, -1.0 / (omega * valSI))
+                zTotal = SCE.Y(yLoad + yL)
+            case .parallelC:
+                // Parallel capacitor: Y_total = Y_load + jωC
+                let yLoad = SCE.Y(zLoad)
+                let yC = Complex(0, omega * valSI)
+                zTotal = SCE.Y(yLoad + yC)
+            }
+
+            guard zTotal.re.isFinite, zTotal.im.isFinite else { return nil }
+            let zn = SCE.norm(zTotal, z0: z0)
+            let g  = SCE.gamma(zn)
+            guard g.magnitude <= 2.0 else { return nil }
+            return SCE.screen(g, c, r)
+        }
+    }
+
+    // MARK: Feature 4 — Matching Wizard
+    func computeMatching() {
+        let RL = loadR
+        let XL = loadX
+
+        guard RL > 0 else { wizardSolutions = []; return }
+
+        var sols = [MatchSolution]()
+
+        // Normalised component values — the UI sliders use normalised B and X
+        // so we compute normalised shuntB and seriesX to feed back.
+        // Reference: classic L-network design for RL→z0 matching
+        // See Pozar "Microwave Engineering" ch 5
+
+        func fmtX(_ v: Double) -> String { String(format: "%+.4f Ω", v) }
+        func fmtB(_ v: Double) -> String { String(format: "%+.6f S", v) }
+        func fmtNX(_ v: Double) -> String { String(format: "%+.4f (norm)", v) }
+        func fmtNB(_ v: Double) -> String { String(format: "%+.4f (norm)", v) }
+
+        if RL > z0 {
+            // Topology A (shunt B at load, series X toward source)
+            // Q = sqrt(RL/z0 - 1)
+            let Q = (RL/z0 - 1.0).squareRoot()
+            // Two sign choices for Q
+            for sign in [1.0, -1.0] {
+                let Bs = sign * Q / RL             // shunt susceptance (S)
+                let Xs = sign * Q * z0 - XL        // series reactance (Ω) net of load X
+                // Normalise for UI: shuntB is in normalised admittance (×z0),
+                // seriesX is in normalised impedance (×/z0)
+                let normB = Bs * z0
+                let normX = Xs / z0
+                let label = sign > 0 ? "L-net A (Q=+\(String(format:"%.3f",Q)))" : "L-net A (Q=−\(String(format:"%.3f",Q)))"
+                sols.append(MatchSolution(
+                    label: label,
+                    steps: [
+                        "Shunt B = \(fmtB(Bs))  [\(fmtNB(normB)) norm]",
+                        "Series X = \(fmtX(Xs))  [\(fmtNX(normX)) norm]"
+                    ],
+                    shuntB: normB,
+                    seriesX: normX
+                ))
+            }
+        } else {
+            // Topology B (series X at load, shunt B toward source)
+            // Q = sqrt(z0/RL - 1)
+            let Q = (z0/RL - 1.0).squareRoot()
+            for sign in [1.0, -1.0] {
+                let Xs = sign * Q * RL - XL
+                let Bs = sign * Q / z0
+                let normB = Bs * z0
+                let normX = Xs / z0
+                let label = sign > 0 ? "L-net B (Q=+\(String(format:"%.3f",Q)))" : "L-net B (Q=−\(String(format:"%.3f",Q)))"
+                sols.append(MatchSolution(
+                    label: label,
+                    steps: [
+                        "Series X = \(fmtX(Xs))  [\(fmtNX(normX)) norm]",
+                        "Shunt B = \(fmtB(Bs))  [\(fmtNB(normB)) norm]"
+                    ],
+                    shuntB: normB,
+                    seriesX: normX
+                ))
+            }
+        }
+        wizardSolutions = sols
+    }
+
+    // MARK: Apply load from tap/drag Γ
+    func applyGamma(_ g: Complex) {
+        guard g.magnitude < 1.0 else { return }
+        let zn = SCE.zFromGamma(g)
+        guard zn.re.isFinite, zn.im.isFinite else { return }
+        loadR = min(max(zn.re * z0, 0.1), 1000.0)
+        loadX = min(max(zn.im * z0, -1000.0), 1000.0)
+    }
 }
 
 // MARK: - Grid Values
-// Traditional Smith Chart density — fine subdivisions with distinguished main lines
 
 private let rAll: [Double] = [
     0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
@@ -124,12 +290,14 @@ private let xAll: [Double] = [
 ]
 private let xKey: Set<Double> = [0.2, 0.5, 1, 2, 5]
 
-// MARK: - Canvas View
-// center + radius are computed from the Canvas's own `size` at draw time,
-// so they update automatically on every rotation or resize.
+// MARK: - Smith Canvas View
 
 struct SmithCanvas: View {
     @ObservedObject var vm: VM
+
+    // Layout state captured during rendering so gestures use consistent coords
+    @State private var canvasCenter: CGPoint = .zero
+    @State private var canvasRadius: CGFloat = 1.0
 
     private let zC = Color(red: 0.85, green: 0.42, blue: 0.42)
     private let yC = Color(red: 0.42, green: 0.62, blue: 0.92)
@@ -140,20 +308,88 @@ struct SmithCanvas: View {
     ]
 
     var body: some View {
-        Canvas { ctx, size in
-            // Always recompute from canvas's live size — fixes the rotation bug
-            let side = min(size.width, size.height)
-            let c    = CGPoint(x: size.width/2, y: size.height/2)
+        GeometryReader { geo in
+            let side = min(geo.size.width, geo.size.height)
+            let c    = CGPoint(x: geo.size.width/2, y: geo.size.height/2)
             let r    = side * 0.47
 
-            bg(ctx, c, r)
-            if vm.showY { yGrid(ctx, c, r) }
-            zGrid(ctx, c, r)
-            ring(ctx, c, r)
-            traj(ctx, c, r)
-            markers(ctx, c, r)
+            ZStack {
+                Canvas { ctx, size in
+                    bg(ctx, c, r)
+                    if vm.showY { yGrid(ctx, c, r) }
+                    zGrid(ctx, c, r)
+                    ring(ctx, c, r)
+                    traj(ctx, c, r)
+                    sweepTrace(ctx, c, r)
+                    markers(ctx, c, r)
+                    if let dg = vm.dragGamma {
+                        crosshair(ctx, gamma: dg, c: c, r: r)
+                    }
+                }
+                .background(Color(white: 0.04))
+                .onAppear {
+                    canvasCenter = c
+                    canvasRadius = r
+                }
+                .onChange(of: geo.size) { _ in
+                    canvasCenter = c
+                    canvasRadius = r
+                }
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { val in
+                            let g = SCE.gammaFromScreen(val.location, c, r)
+                            vm.dragGamma = g
+                            vm.applyGamma(g)
+                        }
+                        .onEnded { val in
+                            let g = SCE.gammaFromScreen(val.location, c, r)
+                            vm.applyGamma(g)
+                            vm.dragGamma = nil
+                        }
+                )
+            }
         }
-        .background(Color(white: 0.04))
+    }
+
+    // MARK: Crosshair overlay while dragging
+    private func crosshair(_ ctx: GraphicsContext, gamma: Complex, c: CGPoint, r: CGFloat) {
+        guard gamma.magnitude <= 1.0 else { return }
+        let pt = SCE.screen(gamma, c, r)
+        let arm: CGFloat = 12
+        let col = Color.yellow.opacity(0.85)
+
+        var h = Path()
+        h.move(to: CGPoint(x: pt.x - arm, y: pt.y))
+        h.addLine(to: CGPoint(x: pt.x + arm, y: pt.y))
+        var v = Path()
+        v.move(to: CGPoint(x: pt.x, y: pt.y - arm))
+        v.addLine(to: CGPoint(x: pt.x, y: pt.y + arm))
+        ctx.stroke(h, with: .color(col), lineWidth: 1.2)
+        ctx.stroke(v, with: .color(col), lineWidth: 1.2)
+
+        var circle = Path()
+        circle.addEllipse(in: CGRect(x: pt.x-5, y: pt.y-5, width: 10, height: 10))
+        ctx.stroke(circle, with: .color(col), lineWidth: 1.5)
+    }
+
+    // MARK: Frequency sweep trace
+    private func sweepTrace(_ ctx: GraphicsContext, _ c: CGPoint, _ r: CGFloat) {
+        guard vm.sweepEnabled else { return }
+        let pts = vm.sweepPoints(c: c, r: r)
+        guard pts.count > 1 else { return }
+        var p = Path()
+        p.move(to: pts[0])
+        pts.dropFirst().forEach { p.addLine(to: $0) }
+        ctx.stroke(p, with: .color(Color.orange),
+                   style: StrokeStyle(lineWidth: 2.0, dash: [6, 4]))
+        // Start/end dots
+        var dot0 = Path(); dot0.addEllipse(in: CGRect(x: pts[0].x-4, y: pts[0].y-4, width: 8, height: 8))
+        ctx.fill(dot0, with: .color(Color.orange))
+        if let last = pts.last {
+            var dotN = Path(); dotN.addEllipse(in: CGRect(x: last.x-4, y: last.y-4, width: 8, height: 8))
+            ctx.fill(dotN, with: .color(Color.orange.opacity(0.5)))
+        }
     }
 
     // MARK: Background disk + real axis
@@ -166,7 +402,7 @@ struct SmithCanvas: View {
         ctx.stroke(ax, with: .color(.gray.opacity(0.3)), lineWidth: 0.4)
     }
 
-    // MARK: Outer ring + constant-|Γ| (SWR) reference circles
+    // MARK: Outer ring + SWR reference circles
     private func ring(_ ctx: GraphicsContext, _ c: CGPoint, _ r: CGFloat) {
         var p = Path(); p.addEllipse(in: rc(c, r))
         ctx.stroke(p, with: .color(Color(white: 0.72)), lineWidth: 1.2)
@@ -176,12 +412,9 @@ struct SmithCanvas: View {
         }
     }
 
-    // MARK: Z grid — constant-R circles and constant-X arcs (red family)
+    // MARK: Z grid
     private func zGrid(_ ctx: GraphicsContext, _ c: CGPoint, _ r: CGFloat) {
-        // Clip all arcs to unit circle
         var clip = Path(); clip.addEllipse(in: rc(c, r))
-
-        // Constant-R circles:  center_Γ = (R/(R+1), 0),  radius_Γ = 1/(R+1)
         for rv in rAll {
             let key = rKey.contains(rv)
             let cr  = CGFloat(rv / (rv + 1))
@@ -191,14 +424,10 @@ struct SmithCanvas: View {
             ctx.stroke(p, with: .color(zC.opacity(key ? 0.70 : 0.28)),
                        lineWidth: key ? 0.65 : 0.30)
         }
-
-        // Constant-X arcs:  center_Γ = (1, 1/X),  radius_Γ = 1/|X|
         for x in xAll {
             drawXArc(ctx, x:  x, c: c, r: r, clip: clip)
             drawXArc(ctx, x: -x, c: c, r: r, clip: clip)
         }
-
-        // R-value labels on real axis
         for (rv, txt) in [(0.0,"0"),(0.2,"0.2"),(0.5,"0.5"),(1.0,"1"),(2.0,"2"),(5.0,"5")] {
             let gx  = rv == 0 ? -1.0 : (2*rv/(rv+1) - 1.0)
             let pt  = SCE.screen(Complex(gx, 0), c, r)
@@ -211,12 +440,9 @@ struct SmithCanvas: View {
 
     private func drawXArc(_ ctx: GraphicsContext, x: Double, c: CGPoint, r: CGFloat, clip: Path) {
         let key = xKey.contains(abs(x))
-        // Circle parameters in Γ-plane
-        let rr  = CGFloat(abs(1.0 / x))            // radius
-        let cy  = CGFloat(1.0 / x)                 // Γ_im of center (positive = upper half)
+        let rr  = CGFloat(abs(1.0 / x))
+        let cy  = CGFloat(1.0 / x)
         var arc = Path()
-        // top-left of bounding box = (screen_cx - screen_r, screen_cy - screen_r)
-        // screen_cx = c.x + 1*r,  screen_cy = c.y - cy*r
         arc.addEllipse(in: CGRect(
             x: c.x + (1.0 - rr) * r,
             y: c.y - (cy + rr) * r,
@@ -228,12 +454,9 @@ struct SmithCanvas: View {
                     lineWidth: key ? 0.60 : 0.28)
     }
 
-    // MARK: Y grid — constant-G circles and constant-B arcs (blue family)
-    // Y-chart is the Γ-plane mirror of the Z-chart about the origin.
+    // MARK: Y grid
     private func yGrid(_ ctx: GraphicsContext, _ c: CGPoint, _ r: CGFloat) {
         var clip = Path(); clip.addEllipse(in: rc(c, r))
-
-        // Constant-G circles:  center_Γ = (-G/(G+1), 0),  radius_Γ = 1/(G+1)
         for gv in rAll where gv > 0 {
             let key = rKey.contains(gv)
             let cr  = CGFloat(-gv / (gv + 1))
@@ -243,8 +466,6 @@ struct SmithCanvas: View {
             ctx.stroke(p, with: .color(yC.opacity(key ? 0.55 : 0.18)),
                        lineWidth: key ? 0.55 : 0.25)
         }
-
-        // Constant-B arcs:  center_Γ = (-1, -1/B),  radius_Γ = 1/|B|
         for b in xAll {
             drawBArc(ctx, b:  b, c: c, r: r, clip: clip)
             drawBArc(ctx, b: -b, c: c, r: r, clip: clip)
@@ -254,9 +475,8 @@ struct SmithCanvas: View {
     private func drawBArc(_ ctx: GraphicsContext, b: Double, c: CGPoint, r: CGFloat, clip: Path) {
         let key = xKey.contains(abs(b))
         let rr  = CGFloat(abs(1.0 / b))
-        let cy  = CGFloat(-1.0 / b)               // Γ_im of center
+        let cy  = CGFloat(-1.0 / b)
         var arc = Path()
-        // screen_cx = c.x + (-1)*r,  screen_cy = c.y - cy*r
         arc.addEllipse(in: CGRect(
             x: c.x + (-1.0 - rr) * r,
             y: c.y - (cy + rr) * r,
@@ -268,7 +488,7 @@ struct SmithCanvas: View {
                     lineWidth: key ? 0.52 : 0.25)
     }
 
-    // MARK: Trajectory arcs with arrow heads
+    // MARK: Trajectory arcs
     private func traj(_ ctx: GraphicsContext, _ c: CGPoint, _ r: CGFloat) {
         let segs = vm.trajectory(c: c, r: r)
         for (i, s) in segs.enumerated() {
@@ -314,6 +534,63 @@ struct SmithCanvas: View {
         CGRect(x: c.x-r, y: c.y-r, width: r*2, height: r*2)
     }
 }
+
+// MARK: - Feature 3: Export / Share
+
+#if canImport(UIKit)
+/// UIViewControllerRepresentable wrapper for UIActivityViewController
+struct ActivityViewControllerWrapper: UIViewControllerRepresentable {
+    let image: UIImage
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [image], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+struct ShareButton: View {
+    @ObservedObject var vm: VM
+    @State private var showShare = false
+    @State private var renderedImage: UIImage? = nil
+
+    var body: some View {
+        Button {
+            renderAndShare()
+        } label: {
+            Image(systemName: "square.and.arrow.up")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundColor(.white)
+                .padding(10)
+                .background(Circle().fill(Color(white: 0.15).opacity(0.85)))
+        }
+        .sheet(isPresented: $showShare) {
+            if let img = renderedImage {
+                ActivityViewControllerWrapper(image: img)
+            }
+        }
+    }
+
+    private func renderAndShare() {
+        let exportVM = vm  // capture reference
+
+        // Build a 1024×1024 canvas for export
+        let exportSize = CGSize(width: 1024, height: 1024)
+        let renderer  = ImageRenderer(content:
+            SmithCanvas(vm: exportVM)
+                .frame(width: exportSize.width, height: exportSize.height)
+                .preferredColorScheme(.dark)
+        )
+        renderer.scale = 1.0
+        renderer.proposedSize = ProposedViewSize(exportSize)
+
+        if let uiImage = renderer.uiImage {
+            renderedImage = uiImage
+            showShare = true
+        }
+    }
+}
+#endif
 
 // MARK: - Marker Row
 
@@ -370,7 +647,39 @@ struct SliderRow: View {
     }
 }
 
-// MARK: - Controls Panel (reusable in both orientations)
+// MARK: - Matching Solution Card
+
+struct MatchSolutionCard: View {
+    let sol: MatchSolution
+    let onApply: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(sol.label)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.orange)
+                Spacer()
+                Button("Apply") { onApply() }
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.orange))
+            }
+            ForEach(sol.steps, id: \.self) { step in
+                Text(step)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.85))
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 7).fill(Color(white: 0.14)))
+        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.orange.opacity(0.35), lineWidth: 0.8))
+    }
+}
+
+// MARK: - Controls Panel
 
 struct ControlsPanel: View {
     @ObservedObject var vm: VM
@@ -394,6 +703,7 @@ struct ControlsPanel: View {
                 div()
                 // Load
                 lbl("① Load  (Z₀ = 50 Ω)")
+                note("Tap/drag on chart to set load point")
                 SliderRow(label: "R (Ω)", value: $vm.loadR, range: 1...500,    fmt: "%.0f Ω")
                 SliderRow(label: "X (Ω)", value: $vm.loadX, range: -300...300, fmt: "%.0f Ω")
                 div()
@@ -414,6 +724,70 @@ struct ControlsPanel: View {
                     SliderRow(label: "θ (°)", value: $vm.tLineDeg, range: 0...360, fmt: "%.1f°", color: green)
                 }
                 div()
+
+                // MARK: Frequency Sweep section
+                HStack {
+                    lbl("Frequency Sweep")
+                    Spacer()
+                    Toggle("", isOn: $vm.sweepEnabled)
+                        .labelsHidden()
+                        .tint(.orange)
+                }
+                if vm.sweepEnabled {
+                    note("Dashed orange trace shows impedance vs frequency")
+                    Picker("Component", selection: $vm.componentType) {
+                        ForEach(ComponentType.allCases) { ct in
+                            Text(ct.rawValue).tag(ct)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .colorMultiply(Color.orange.opacity(0.8))
+
+                    let valLabel: String = (vm.componentType == .seriesL || vm.componentType == .parallelL) ? "Value (nH)" : "Value (pF)"
+                    let valRange: ClosedRange<Double> = (vm.componentType == .seriesL || vm.componentType == .parallelL)
+                        ? 0.1...1000.0 : 0.1...1000.0
+                    SliderRow(label: valLabel, value: $vm.componentValue, range: valRange,
+                              fmt: "%.1f", color: .orange)
+                    SliderRow(label: "f start (MHz)", value: $vm.freqStart, range: 1...10000,
+                              fmt: "%.0f MHz", color: .orange)
+                    SliderRow(label: "f end (MHz)",   value: $vm.freqEnd,   range: 1...10000,
+                              fmt: "%.0f MHz", color: .orange)
+                }
+                div()
+
+                // MARK: Matching Wizard section
+                HStack {
+                    lbl("Matching Wizard")
+                    Spacer()
+                    Toggle("", isOn: $vm.wizardEnabled)
+                        .labelsHidden()
+                        .tint(.yellow)
+                }
+                if vm.wizardEnabled {
+                    note("L-network solutions to match load to Z₀=50Ω")
+                    Button {
+                        vm.computeMatching()
+                    } label: {
+                        HStack {
+                            Image(systemName: "wand.and.stars")
+                            Text("Compute Solutions")
+                        }
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.black)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.yellow))
+                    }
+
+                    ForEach(vm.wizardSolutions) { sol in
+                        MatchSolutionCard(sol: sol) {
+                            vm.shuntB  = sol.shuntB
+                            vm.seriesX = sol.seriesX
+                        }
+                    }
+                }
+                div()
+
                 // Readouts
                 lbl("Marker Readouts")
                 ForEach(vm.markers) { m in MarkerRow(m: m) }
@@ -438,8 +812,6 @@ struct ControlsPanel: View {
 }
 
 // MARK: - Root View
-// GeometryReader at the top level drives the layout switch on every rotation.
-// SmithCanvas uses Canvas { ctx, size } so its center/radius are always live.
 
 struct ContentView: View {
     @StateObject private var vm = VM()
@@ -449,21 +821,16 @@ struct ContentView: View {
             let landscape = geo.size.width > geo.size.height
 
             if landscape {
-                // ── Landscape: chart fills square on left, controls sidebar on right ──
                 let ctrlW: CGFloat = min(310, geo.size.width * 0.36)
                 HStack(spacing: 0) {
-                    SmithCanvas(vm: vm)
-                        .frame(width: geo.size.width - ctrlW,
-                               height: geo.size.height)
+                    chartArea(width: geo.size.width - ctrlW, height: geo.size.height)
                     ControlsPanel(vm: vm)
                         .frame(width: ctrlW, height: geo.size.height)
                 }
             } else {
-                // ── Portrait: chart square on top, controls scroll below ──
-                let chartH: CGFloat = geo.size.width   // square
+                let chartH: CGFloat = geo.size.width
                 VStack(spacing: 0) {
-                    SmithCanvas(vm: vm)
-                        .frame(width: geo.size.width, height: chartH)
+                    chartArea(width: geo.size.width, height: chartH)
                     ControlsPanel(vm: vm)
                         .frame(width: geo.size.width,
                                height: max(0, geo.size.height - chartH))
@@ -472,5 +839,18 @@ struct ContentView: View {
         }
         .ignoresSafeArea(edges: .bottom)
         .preferredColorScheme(.dark)
+    }
+
+    @ViewBuilder
+    private func chartArea(width: CGFloat, height: CGFloat) -> some View {
+        ZStack(alignment: .topTrailing) {
+            SmithCanvas(vm: vm)
+                .frame(width: width, height: height)
+            #if canImport(UIKit)
+            ShareButton(vm: vm)
+                .padding(10)
+            #endif
+        }
+        .frame(width: width, height: height)
     }
 }
